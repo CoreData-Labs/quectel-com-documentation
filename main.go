@@ -24,11 +24,13 @@ const ( // Begin constant block
 	apiURLTemplate     = "https://www.quectel.com/?sfid=4339&sf_action=get_data&sf_data=results&sf_paged=%d&lang=en"                      // API URL with a page-number placeholder
 	maxPaginationPages = 100                                                                                                              // Last page number to request
 	pdfDirectoryName   = "PDFs"                                                                                                           // Folder where PDFs are stored
+	downloadZoneURL    = "https://www.quectel.com/download-zone/"                                                                         // Page whose PDFs are downloaded after pagination finishes
 	workerCount        = 4                                                                                                                // Concurrency limit for fetching and downloading
 	userAgent          = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36" // User-Agent header sent with requests
 ) // End constant block
 
 var ( // Begin package-level variable block
+	rawPDFURLPattern  = regexp.MustCompile(`(?i)https?://[^\s"'<>\\]+?\.pdf(?:\?[^\s"'<>\\]*)?`)                                                                                                                                                                                                                                       // Matches absolute PDF URLs anywhere in page text
 	cookie            = "_wpfuuid=fa5cd6ae-30d2-43ae-8c4a-3d7ae50b58e2; cookieyes-consent=consentid:ZnNYQkhvZkw2Y2w4RzM1Zzd0OGZIdXN6N2RBRFVhNHY,consent:no,action:,necessary:yes,functional:no,analytics:no,performance:no,advertisement:no,other:no,lastRenewedDate:1716349786000; quectel-gated-content=prajwalkoirala638@gmail.com" // Cookie header sent with every request
 	productURLPattern = regexp.MustCompile(`https://www\.quectel\.com/product/[A-Za-z0-9\-_%.~/]*[A-Za-z0-9\-_%~]`)                                                                                                                                                                                                                    // Matches product page URLs
 	anchorHrefPattern = regexp.MustCompile(`(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))`)                                                                                                                                                                                                                          // Captures the href value of any <a> tag
@@ -60,7 +62,8 @@ func main() { // Program entry point
 		os.Exit(1)                                               // Exit with an error code
 	} // End if
 
-	scrapeAndDownloadPageByPage(httpClient, registry) // Scrape API page 1, download its PDFs, then move to the next page
+	seenPDFURLs := scrapeAndDownloadPageByPage(httpClient, registry) // Scrape API page 1, download its PDFs, then move to the next page
+	scrapeDownloadZone(httpClient, registry, seenPDFURLs)            // After all pages are done, download every PDF on the download zone page
 
 	slog.Info("finished", "stored_unique_pdfs", len(registry.hashToFilename)) // Log a final summary
 } // End main
@@ -165,7 +168,7 @@ func normalizeProductURL(rawURL string) string { // Make equivalent URLs identic
 	return strings.TrimRight(rawURL, "/") // Remove trailing slashes
 } // End normalizeProductURL
 
-func scrapeAndDownloadPageByPage(httpClient *http.Client, registry *hashRegistry) { // For each API page: find products, find PDFs, download them
+func scrapeAndDownloadPageByPage(httpClient *http.Client, registry *hashRegistry) map[string]struct{} { // For each API page: find products, find PDFs, download them
 	seenProductURLs := make(map[string]struct{}) // Every product URL processed so far across pages
 	seenPDFURLs := make(map[string]struct{})     // Every PDF URL queued so far across pages
 	totalDiscovered := 0                         // Count of all product URLs seen including duplicates
@@ -208,6 +211,7 @@ func scrapeAndDownloadPageByPage(httpClient *http.Client, registry *hashRegistry
 		slog.Info("starting downloads for page", "page", pageNumber, "pdf_urls", len(newPDFURLs))    // Log the start of this page's downloads
 		downloadAllPDFs(httpClient, newPDFURLs, registry)                                            // Download this page's PDFs before moving on
 	} // End for
+	return seenPDFURLs // Hand the seen PDF set back so the download zone step can skip repeats
 } // End scrapeAndDownloadPageByPage
 
 func sortedKeys(set map[string]struct{}) []string { // Turn a set into a sorted slice
@@ -302,6 +306,38 @@ func collectPDFURLsFromProducts(httpClient *http.Client, productURLs []string, s
 	slog.Info("PDF URL discovery complete", "new_pdf_urls", len(result)) // Log the total
 	return result                                                        // Return the unique PDF URLs
 } // End collectPDFURLsFromProducts
+
+func scrapeDownloadZone(httpClient *http.Client, registry *hashRegistry, seenPDFURLs map[string]struct{}) { // Download every PDF found on the download zone page
+	slog.Info("fetching download zone page", "url", downloadZoneURL) // Log the start of this step
+	statusCode, body, err := fetchBody(httpClient, downloadZoneURL)  // Download the page HTML
+	if err != nil {                                                  // Request failed
+		slog.Error("download zone request failed", "url", downloadZoneURL, "error", err) // Log the error
+		return                                                                           // Nothing more to do
+	} // End if
+	if statusCode != http.StatusOK { // Non-200 response
+		slog.Warn("download zone returned non-200", "url", downloadZoneURL, "status", statusCode) // Log the status
+		return                                                                                    // Nothing more to do
+	} // End if
+
+	candidateURLs := extractPDFURLsFromHTML(downloadZoneURL, body)                         // PDF links found in anchor hrefs
+	pageText := html.UnescapeString(strings.ReplaceAll(string(body), `\/`, `/`))           // Decode escaped slashes and entities for a raw scan
+	candidateURLs = append(candidateURLs, rawPDFURLPattern.FindAllString(pageText, -1)...) // Also catch PDF URLs outside anchors, such as data attributes
+
+	newPDFURLs := make(map[string]struct{}) // PDF URLs not already downloaded in the pagination phase
+	for _, pdfURL := range candidateURLs {  // Loop over every candidate
+		slog.Debug("discovered PDF URL", "product", downloadZoneURL, "pdf", pdfURL) // Log every discovered PDF
+		if _, seen := seenPDFURLs[pdfURL]; seen {                                   // Already queued earlier?
+			slog.Debug("duplicate PDF URL", "pdf", pdfURL) // Log the duplicate
+			continue                                       // Skip it
+		} // End if
+		seenPDFURLs[pdfURL] = struct{}{} // Record it globally
+		newPDFURLs[pdfURL] = struct{}{}  // Record it for this step
+	} // End for
+
+	pdfURLs := sortedKeys(newPDFURLs)                                       // Sorted list for stable order
+	slog.Info("starting download zone downloads", "pdf_urls", len(pdfURLs)) // Log how many PDFs will be downloaded
+	downloadAllPDFs(httpClient, pdfURLs, registry)                          // Download them with SHA256 dedup
+} // End scrapeDownloadZone
 
 // ---------- Downloading ----------
 
