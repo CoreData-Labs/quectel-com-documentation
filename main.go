@@ -59,11 +59,9 @@ func main() { // Program entry point
 		os.Exit(1)                                               // Exit with an error code
 	} // End if
 
-	productURLs := collectProductURLs(httpClient)                  // Paginate the API and gather unique product URLs
-	pdfURLs := collectPDFURLsFromProducts(httpClient, productURLs) // Visit each product page and gather unique PDF URLs
-	downloadAllPDFs(httpClient, pdfURLs, registry)                 // Download all PDFs with dedup
+	scrapeAndDownloadPageByPage(httpClient, registry) // Scrape API page 1, download its PDFs, then move to the next page
 
-	slog.Info("finished", "product_pages", len(productURLs), "pdf_urls", len(pdfURLs), "stored_unique_pdfs", len(registry.hashToFilename)) // Log a final summary
+	slog.Info("finished", "stored_unique_pdfs", len(registry.hashToFilename)) // Log a final summary
 } // End main
 
 // ---------- Directory and hashing helpers ----------
@@ -165,9 +163,10 @@ func normalizeProductURL(rawURL string) string { // Make equivalent URLs identic
 	return strings.TrimRight(rawURL, "/") // Remove trailing slashes
 } // End normalizeProductURL
 
-func collectProductURLs(httpClient *http.Client) []string { // Paginate the API and deduplicate URLs
-	uniqueProductURLs := make(map[string]struct{}) // Set of unique product URLs
-	totalDiscovered := 0                           // Count of all URLs seen including duplicates
+func scrapeAndDownloadPageByPage(httpClient *http.Client, registry *hashRegistry) { // For each API page: find products, find PDFs, download them
+	seenProductURLs := make(map[string]struct{}) // Every product URL processed so far across pages
+	seenPDFURLs := make(map[string]struct{})     // Every PDF URL queued so far across pages
+	totalDiscovered := 0                         // Count of all product URLs seen including duplicates
 
 	for pageNumber := 1; pageNumber <= maxPaginationPages; pageNumber++ { // Loop pages 1 to 100
 		pageURL := fmt.Sprintf(apiURLTemplate, pageNumber)                    // Build this page's API URL
@@ -190,21 +189,24 @@ func collectProductURLs(httpClient *http.Client) []string { // Paginate the API 
 			break                                                                         // Stop pagination
 		} // End if
 
+		newProductSet := make(map[string]struct{})   // Product URLs on this page not seen on earlier pages
 		for _, productURL := range pageProductURLs { // Loop over this page's URLs
-			totalDiscovered++                                   // Count every discovered URL
-			if _, seen := uniqueProductURLs[productURL]; seen { // Already recorded?
+			totalDiscovered++                                 // Count every discovered URL
+			if _, seen := seenProductURLs[productURL]; seen { // Already processed on an earlier page or earlier in this page?
 				slog.Debug("duplicate product URL", "url", productURL) // Log the duplicate
 				continue                                               // Skip it
 			} // End if
-			uniqueProductURLs[productURL] = struct{}{}       // Record the new URL
+			seenProductURLs[productURL] = struct{}{}         // Record the new URL globally
+			newProductSet[productURL] = struct{}{}           // Record it for this page's processing
 			slog.Debug("new product URL", "url", productURL) // Log the new URL
 		} // End for
-	} // End for
+		slog.Info("product URLs for page", "page", pageNumber, "new", len(newProductSet), "total_discovered", totalDiscovered, "total_unique", len(seenProductURLs)) // Log page totals
 
-	result := sortedKeys(uniqueProductURLs)                                                                 // Convert the set to a sorted slice
-	slog.Info("product URL discovery complete", "total_discovered", totalDiscovered, "unique", len(result)) // Log totals
-	return result                                                                                           // Return the unique URLs
-} // End collectProductURLs
+		newPDFURLs := collectPDFURLsFromProducts(httpClient, sortedKeys(newProductSet), seenPDFURLs) // Visit this page's products and gather new PDF URLs
+		slog.Info("starting downloads for page", "page", pageNumber, "pdf_urls", len(newPDFURLs))    // Log the start of this page's downloads
+		downloadAllPDFs(httpClient, newPDFURLs, registry)                                            // Download this page's PDFs before moving on
+	} // End for
+} // End scrapeAndDownloadPageByPage
 
 func sortedKeys(set map[string]struct{}) []string { // Turn a set into a sorted slice
 	keys := make([]string, 0, len(set)) // Preallocate the slice
@@ -248,8 +250,8 @@ func extractPDFURLsFromHTML(pageURL string, htmlBody []byte) []string { // Find 
 	return pdfURLs // Return the PDF URLs found
 } // End extractPDFURLsFromHTML
 
-func collectPDFURLsFromProducts(httpClient *http.Client, productURLs []string) []string { // Visit all product pages concurrently
-	uniquePDFURLs := make(map[string]struct{}) // Set of unique PDF URLs
+func collectPDFURLsFromProducts(httpClient *http.Client, productURLs []string, seenPDFURLs map[string]struct{}) []string { // Visit product pages concurrently and return only PDF URLs not seen before
+	uniquePDFURLs := make(map[string]struct{}) // Set of new PDF URLs found in this call
 	var resultsMutex sync.Mutex                // Protects the shared set
 
 	jobs := make(chan string)    // Channel feeding product URLs to workers
@@ -276,11 +278,12 @@ func collectPDFURLsFromProducts(httpClient *http.Client, productURLs []string) [
 				} // End for
 				resultsMutex.Lock()                  // Lock before touching the shared set
 				for _, pdfURL := range pagePDFURLs { // Loop again to record them
-					if _, seen := uniquePDFURLs[pdfURL]; seen { // Already recorded?
+					if _, seen := seenPDFURLs[pdfURL]; seen { // Already queued on this or an earlier page?
 						slog.Debug("duplicate PDF URL", "pdf", pdfURL) // Log the duplicate
 						continue                                       // Skip it
 					} // End if
-					uniquePDFURLs[pdfURL] = struct{}{} // Record the new PDF URL
+					seenPDFURLs[pdfURL] = struct{}{}   // Record it globally so later pages skip it
+					uniquePDFURLs[pdfURL] = struct{}{} // Record it as new for this call
 				} // End for
 				resultsMutex.Unlock() // Release the lock
 			} // End for
@@ -293,9 +296,9 @@ func collectPDFURLsFromProducts(httpClient *http.Client, productURLs []string) [
 	close(jobs)      // Signal that no more jobs are coming
 	waitGroup.Wait() // Wait for all workers to finish
 
-	result := sortedKeys(uniquePDFURLs)                                     // Convert the set to a sorted slice
-	slog.Info("PDF URL discovery complete", "unique_pdf_urls", len(result)) // Log the total
-	return result                                                           // Return the unique PDF URLs
+	result := sortedKeys(uniquePDFURLs)                                  // Convert the set to a sorted slice
+	slog.Info("PDF URL discovery complete", "new_pdf_urls", len(result)) // Log the total
+	return result                                                        // Return the unique PDF URLs
 } // End collectPDFURLsFromProducts
 
 // ---------- Downloading ----------
