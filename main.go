@@ -29,8 +29,9 @@ const ( // Begin constant block
 ) // End constant block
 
 var ( // Begin package-level variable block
-	productURLPattern = regexp.MustCompile(`https://www\.quectel\.com/product/[A-Za-z0-9\-_%.~/]*[A-Za-z0-9\-_%~]`) // Matches product page URLs
-	anchorHrefPattern = regexp.MustCompile(`(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))`)       // Captures the href value of any <a> tag
+	cookie            = "_wpfuuid=fa5cd6ae-30d2-43ae-8c4a-3d7ae50b58e2; cookieyes-consent=consentid:ZnNYQkhvZkw2Y2w4RzM1Zzd0OGZIdXN6N2RBRFVhNHY,consent:no,action:,necessary:yes,functional:no,analytics:no,performance:no,advertisement:no,other:no,lastRenewedDate:1716349786000; quectel-gated-content=prajwalkoirala638@gmail.com" // Cookie header sent with every request
+	productURLPattern = regexp.MustCompile(`https://www\.quectel\.com/product/[A-Za-z0-9\-_%.~/]*[A-Za-z0-9\-_%~]`)                                                                                                                                                                                                                    // Matches product page URLs
+	anchorHrefPattern = regexp.MustCompile(`(?is)<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))`)                                                                                                                                                                                                                          // Captures the href value of any <a> tag
 ) // End variable block
 
 // hashRegistry tracks SHA256 hashes of stored PDFs.
@@ -126,6 +127,7 @@ func fetchBody(httpClient *http.Client, targetURL string) (int, []byte, error) {
 		return 0, nil, err // Return the error
 	} // End if
 	request.Header.Set("User-Agent", userAgent) // Set the User-Agent header
+	request.Header.Set("Cookie", cookie)        // Set the Cookie header
 
 	response, err := httpClient.Do(request) // Send the request
 	if err != nil {                         // Check the network error
@@ -360,6 +362,7 @@ func downloadPDF(httpClient *http.Client, pdfURL string, registry *hashRegistry)
 		return err // Return the error
 	} // End if
 	request.Header.Set("User-Agent", userAgent) // Set the User-Agent header
+	request.Header.Set("Cookie", cookie)        // Set the Cookie header
 
 	response, err := httpClient.Do(request) // Send the request
 	if err != nil {                         // Check the network error
