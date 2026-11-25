@@ -38,14 +38,18 @@ def find_pdf_files(directory: Path) -> list[Path]:
 def validate_pdf_file(file_path: Path) -> tuple[bool, str]:
     """Return (is_valid, reason). The reason is empty for valid files."""
     try:
-        if file_path.stat().st_size == 0:  # Zero-byte files can never be valid
+        file_size = file_path.stat().st_size  # Size on disk in bytes
+        logger.debug("Validating %s (%d bytes)", file_path, file_size)
+        if file_size == 0:  # Zero-byte files can never be valid
             return False, "file is empty (0 bytes)"
 
         with fitz.open(file_path) as document:  # Context manager closes the file for us
             if document.needs_pass:  # Encrypted PDFs are not corrupt, just locked
+                logger.debug("%s is password-protected; treating as valid", file_path)
                 return True, ""
             if document.page_count == 0:  # A PDF with no pages is unusable
                 return False, "no pages"
+            logger.debug("%s has %d page(s)", file_path, document.page_count)
             document.load_page(
                 0
             )  # Force-parse the first page to catch hidden corruption
@@ -70,14 +74,20 @@ def remove_file(file_path: Path) -> bool:
 def process_directory(directory: Path) -> ValidationSummary:
     """Validate every PDF under `directory` and delete the invalid ones."""
     summary = ValidationSummary()  # Start with empty counters
+    logger.info("Scanning directory: %s", directory.resolve())
+    pdf_files = find_pdf_files(
+        directory
+    )  # Collect all PDFs first so we can report the total
+    logger.info("Found %d PDF file(s)", len(pdf_files))
 
-    for pdf_path in find_pdf_files(directory):  # Loop over each PDF found
+    for index, pdf_path in enumerate(pdf_files, start=1):  # Loop over each PDF found
+        logger.debug("Processing file %d of %d: %s", index, len(pdf_files), pdf_path)
         summary.checked += 1  # Count it
         is_valid, reason = validate_pdf_file(pdf_path)  # Inspect the file
 
         if is_valid:
             summary.valid += 1  # Count it as good
-            logger.debug("OK: %s", pdf_path)
+            logger.info("Valid PDF: %s", pdf_path)
             continue  # Nothing else to do for good files
 
         summary.invalid.append(pdf_path)  # Remember the bad file
@@ -94,9 +104,12 @@ def process_directory(directory: Path) -> ValidationSummary:
 
 def main() -> int:
     """Entry point. Returns a process exit code."""
-    logging.basicConfig(
-        level=logging.INFO, format="%(levelname)s: %(message)s"
-    )  # Log warnings and summary
+    logging.basicConfig(  # Send every log message to the console
+        level=logging.DEBUG,  # Show everything, including per-file details
+        format="%(asctime)s %(levelname)s: %(message)s",  # Timestamp each line
+        stream=sys.stdout,  # Print to standard output
+    )
+    logger.info("Starting PDF validation")
     fitz.TOOLS.mupdf_display_errors(
         False
     )  # Silence raw MuPDF stderr noise; we log errors ourselves
