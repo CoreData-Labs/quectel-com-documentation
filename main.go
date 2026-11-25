@@ -24,7 +24,7 @@ const ( // Begin constant block
 	apiURLTemplate     = "https://www.quectel.com/?sfid=4339&sf_action=get_data&sf_data=results&sf_paged=%d&lang=en"                      // API URL with a page-number placeholder
 	maxPaginationPages = 100                                                                                                              // Last page number to request
 	pdfDirectoryName   = "PDFs"                                                                                                           // Folder where PDFs are stored
-	workerCount        = 2                                                                                                                // Concurrency limit for fetching and downloading
+	workerCount        = 4                                                                                                                // Concurrency limit for fetching and downloading
 	userAgent          = "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36" // User-Agent header sent with requests
 ) // End constant block
 
@@ -185,6 +185,10 @@ func collectProductURLs(httpClient *http.Client) []string { // Paginate the API 
 
 		pageProductURLs := extractProductURLsFromAPIResponse(body)                                        // Extract URLs from this page
 		slog.Debug("extracted product URLs from page", "page", pageNumber, "count", len(pageProductURLs)) // Log the count
+		if len(pageProductURLs) == 0 {                                                                    // An empty page means we are past the last page of results
+			slog.Info("no product URLs on page, stopping pagination", "page", pageNumber) // Log why pagination ends
+			break                                                                         // Stop pagination
+		} // End if
 
 		for _, productURL := range pageProductURLs { // Loop over this page's URLs
 			totalDiscovered++                                   // Count every discovered URL
